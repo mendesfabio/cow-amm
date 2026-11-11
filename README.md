@@ -48,6 +48,11 @@ yarn test    # run the tests
 ## Features on BCoWFactory
 - Added a `logBCoWPool` to log the finalization of BCoWPool contracts, to be called by a child pool.
 
+## Features on BCoWHelper
+- Supports the full set of tokens bound to a finalized pool.
+- Returns the pairwise order with the greatest surplus at the supplied price vector.
+- Keeps one pool order per settlement, using the existing transient commitment lock.
+
 ## Creating a Pool
 - Create a new pool by calling the corresponding pool factory:
   - `IBFactory.newBPool(name, symbol)` for regular Balancer `BPool`s

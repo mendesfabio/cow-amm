@@ -67,7 +67,10 @@ contract BCoWHelperTest is Test, BMath {
     pool = setUpMockPoolFromDefaults(VALID_WEIGHT, VALID_WEIGHT);
   }
 
-  function setUpMockPoolFromDefaults(uint256 weight0, uint256 weight1) private returns (MockBCoWPool pool_) {
+  function setUpMockPoolFromDefaults(
+    uint256 weight0,
+    uint256 weight1
+  ) private returns (MockBCoWPool pool_) {
     uint256 totalWeight = weight0 + weight1;
     pool_ = new MockBCoWPool(makeAddr('solutionSettler'), bytes32(0), ERC20_NAME, ERC20_SYMBOL);
     pool_.set__tokens(tokens);
@@ -84,7 +87,30 @@ contract BCoWHelperTest is Test, BMath {
     pool_.mock_call_getNormalizedWeight(tokens[1], bdiv(weight1, totalWeight));
   }
 
-  function test_ConstructorWhenCalled(bytes32 _appData) external {
+  function setUpMockPool(
+    address[] memory poolTokens,
+    uint256[] memory weights,
+    uint256[] memory balances
+  ) private returns (MockBCoWPool pool_) {
+    pool_ = new MockBCoWPool(makeAddr('solutionSettler'), bytes32(0), ERC20_NAME, ERC20_SYMBOL);
+    pool_.set__tokens(poolTokens);
+
+    uint256 totalWeight;
+    for (uint256 i; i < poolTokens.length; i++) {
+      totalWeight += weights[i];
+      pool_.set__records(poolTokens[i], IBPool.Record({bound: true, index: i, denorm: weights[i]}));
+      pool_.mock_call_getDenormalizedWeight(poolTokens[i], weights[i]);
+      vm.mockCall(poolTokens[i], abi.encodePacked(IERC20.balanceOf.selector), abi.encode(balances[i]));
+    }
+
+    pool_.set__totalWeight(totalWeight);
+    pool_.set__finalized(true);
+    factory.mock_call_isBPool(address(pool_), true);
+  }
+
+  function test_ConstructorWhenCalled(
+    bytes32 _appData
+  ) external {
     factory.expectCall_APP_DATA();
     factory.mock_call_APP_DATA(_appData);
     helper = new MockBCoWHelper(address(factory));
@@ -105,20 +131,31 @@ contract BCoWHelperTest is Test, BMath {
     address[] memory invalidTokens = new address[](1);
     invalidTokens[0] = makeAddr('token0');
     pool.set__tokens(invalidTokens);
+    BCoWHelper bCoWHelper = new BCoWHelper(address(factory));
     // it should revert
     vm.expectRevert(ICOWAMMPoolHelper.PoolDoesNotExist.selector);
-    helper.tokens(address(pool));
+    bCoWHelper.tokens(address(pool));
   }
 
-  function test_TokensRevertWhen_PoolHasMoreThan2Tokens() external {
-    address[] memory invalidTokens = new address[](3);
-    invalidTokens[0] = makeAddr('token0');
-    invalidTokens[1] = makeAddr('token1');
-    invalidTokens[2] = makeAddr('token2');
+  function test_TokensWhen_PoolHasMoreThan2Tokens() external {
+    address[] memory poolTokens = new address[](3);
+    poolTokens[0] = makeAddr('token0');
+    poolTokens[1] = makeAddr('token1');
+    poolTokens[2] = makeAddr('token2');
+    pool.set__tokens(poolTokens);
+
+    // it should return all pool tokens
+    address[] memory returned = new BCoWHelper(address(factory)).tokens(address(pool));
+    assertEq(returned, poolTokens);
+  }
+
+  function test_TokensRevertWhen_PoolHasMoreThanMaxTokens() external {
+    address[] memory invalidTokens = new address[](MAX_BOUND_TOKENS + 1);
     pool.set__tokens(invalidTokens);
+    BCoWHelper bCoWHelper = new BCoWHelper(address(factory));
     // it should revert
     vm.expectRevert(ICOWAMMPoolHelper.PoolDoesNotExist.selector);
-    helper.tokens(address(pool));
+    bCoWHelper.tokens(address(pool));
   }
 
   function test_TokensWhenPoolWithEqualWeightsIsSupported() external view {
@@ -143,7 +180,9 @@ contract BCoWHelperTest is Test, BMath {
     helper.order(invalidPool, priceVector);
   }
 
-  function test_OrderWhenThePoolIsSupported(bytes32 domainSeparator) external {
+  function test_OrderWhenThePoolIsSupported(
+    bytes32 domainSeparator
+  ) external {
     // it should call tokens
     helper.mock_call_tokens(address(pool), tokens);
     helper.expectCall_tokens(address(pool));
@@ -162,6 +201,98 @@ contract BCoWHelperTest is Test, BMath {
     assertValidStaticOrderParams(order_, factory);
     assertValidInteractions(preInteractions, postInteractions, order_, pool, domainSeparator);
     assertValidSignature(order_, sig, pool);
+  }
+
+  function test_OrderRevertWhen_ThePriceVectorLengthDoesNotMatch() external {
+    uint256[] memory invalidPrices = new uint256[](1);
+
+    // it should revert
+    vm.expectRevert(BCoWHelper.InvalidPriceVector.selector);
+    helper.order(address(pool), invalidPrices);
+  }
+
+  function test_OrderRevertWhen_APriceIsZero() external {
+    priceVector[1] = 0;
+
+    // it should revert
+    vm.expectRevert(BCoWHelper.InvalidPriceVector.selector);
+    helper.order(address(pool), priceVector);
+  }
+
+  function test_OrderRevertWhen_AllTokenPairsAreAtEquilibrium() external {
+    address[] memory poolTokens = new address[](3);
+    uint256[] memory weights = new uint256[](3);
+    uint256[] memory balances = new uint256[](3);
+    uint256[] memory prices = new uint256[](3);
+    for (uint256 i; i < poolTokens.length; i++) {
+      poolTokens[i] = makeAddr(string.concat('token', vm.toString(i)));
+      weights[i] = 10e18;
+      balances[i] = 100e18;
+      prices[i] = 1;
+    }
+    pool = setUpMockPool(poolTokens, weights, balances);
+    helper.mock_call_tokens(address(pool), poolTokens);
+
+    // it should revert
+    vm.expectRevert(ICOWAMMPoolHelper.NoOrder.selector);
+    helper.order(address(pool), prices);
+  }
+
+  function test_OrderWhen_AmountInExceedsMaxRatio() external {
+    uint256 balance = 100e18;
+    vm.mockCall(tokens[0], abi.encodePacked(IERC20.balanceOf.selector), abi.encode(balance));
+    vm.mockCall(tokens[1], abi.encodePacked(IERC20.balanceOf.selector), abi.encode(balance));
+    helper.mock_call_tokens(address(pool), tokens);
+
+    priceVector[0] = 1;
+    priceVector[1] = 100;
+
+    (GPv2Order.Data memory order_,,,) = helper.order(address(pool), priceVector);
+
+    // it should cap the input amount
+    assertEq(order_.buyAmount, bmul(balance, MAX_IN_RATIO));
+    // it should return a valid pool order
+    pool.verify(order_);
+  }
+
+  function test_OrderWhen_PoolHasMoreThan2Tokens() external {
+    address[] memory poolTokens = new address[](3);
+    poolTokens[0] = makeAddr('token0');
+    poolTokens[1] = makeAddr('token1');
+    poolTokens[2] = makeAddr('token2');
+
+    uint256[] memory weights = new uint256[](3);
+    weights[0] = 10e18;
+    weights[1] = 10e18;
+    weights[2] = 10e18;
+
+    uint256[] memory balances = new uint256[](3);
+    balances[0] = 100e18;
+    balances[1] = 100e18;
+    balances[2] = 200e18;
+
+    // Deliberately use unscaled relative prices, as allowed by ICOWAMMPoolHelper.
+    uint256[] memory prices = new uint256[](3);
+    prices[0] = 1;
+    prices[1] = 1;
+    prices[2] = 1;
+
+    pool = setUpMockPool(poolTokens, weights, balances);
+    helper.mock_call_tokens(address(pool), poolTokens);
+
+    (GPv2Order.Data memory order_,,,) = helper.order(address(pool), prices);
+
+    // it should select the pair with the greatest surplus
+    // Pairs (token0, token2) and (token1, token2) have equal surplus, so the
+    // first pair wins the deterministic token-order tie break.
+    assertEq(address(order_.buyToken), poolTokens[0]);
+    assertEq(address(order_.sellToken), poolTokens[2]);
+    assertApproxEqAbs(order_.buyAmount, uint256(100e18) / 3, 1_000_000_000);
+    assertApproxEqAbs(order_.sellAmount, 50e18, 1_000_000_000);
+    assertLe(order_.buyAmount, bmul(balances[0], MAX_IN_RATIO));
+
+    // it should return a valid pool order
+    pool.verify(order_);
   }
 
   function test_OrderGivenAPriceSkewenessToToken1(
@@ -380,7 +511,10 @@ contract BCoWHelperTest is Test, BMath {
     pool.verify(order_);
   }
 
-  function assertValidStaticOrderParams(GPv2Order.Data memory order_, MockBCoWFactory factory_) internal {
+  function assertValidStaticOrderParams(
+    GPv2Order.Data memory order_,
+    MockBCoWFactory factory_
+  ) internal {
     // it should return a valid pool order
     assertEq(order_.receiver, GPv2Order.RECEIVER_SAME_AS_OWNER);
     assertLe(order_.validTo, block.timestamp + 5 minutes);
@@ -409,7 +543,11 @@ contract BCoWHelperTest is Test, BMath {
     assertTrue(postInteractions.length == 0);
   }
 
-  function assertValidSignature(GPv2Order.Data memory order_, bytes memory sig, MockBCoWPool pool_) internal {
+  function assertValidSignature(
+    GPv2Order.Data memory order_,
+    bytes memory sig,
+    MockBCoWPool pool_
+  ) internal {
     // it should return a valid signature
     bytes memory validSig = abi.encodePacked(pool_, abi.encode(order_));
     assertEq(keccak256(validSig), keccak256(sig));

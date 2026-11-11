@@ -9,6 +9,7 @@ import {ICOWAMMPoolHelper} from '@cow-amm/interfaces/ICOWAMMPoolHelper.sol';
 import {IERC20} from '@cowprotocol/interfaces/IERC20.sol';
 import {GPv2Interaction} from '@cowprotocol/libraries/GPv2Interaction.sol';
 import {GPv2Order} from '@cowprotocol/libraries/GPv2Order.sol';
+import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 
 import {BCoWConst} from './BCoWConst.sol';
 import {BMath} from './BMath.sol';
@@ -16,7 +17,6 @@ import {BMath} from './BMath.sol';
 /**
  * @title BCoWHelper
  * @notice Helper contract that allows to trade on CoW Swap Protocol.
- * @dev This contract supports only 2-token pools.
  */
 contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
   using GPv2Order for GPv2Order.Data;
@@ -26,13 +26,27 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
    * @param token The token all fields depend on
    * @param balance The pool balance for the token
    * @param denormWeight Denormalized weight of the token
-   * @param normWeight Normalized weight of the token
+   * @param price Price of the token in the price vector
    */
   struct Reserves {
     IERC20 token;
     uint256 balance;
     uint256 denormWeight;
-    uint256 normWeight;
+    uint256 price;
+  }
+
+  /**
+   * @dev Best order found while iterating over all token pairs.
+   * @param reservesIn Details for the input token to the pool
+   * @param reservesOut Details for the output token from the pool
+   * @param amountIn Token amount moving into the pool
+   * @param surplus Order surplus at the supplied prices
+   */
+  struct OrderCandidate {
+    Reserves reservesIn;
+    Reserves reservesOut;
+    uint256 amountIn;
+    uint256 surplus;
   }
 
   /// @notice The app data used by this helper's factory.
@@ -45,7 +59,12 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
   /// @notice The input token to the call is not traded on the pool.
   error InvalidToken();
 
-  constructor(address factory_) {
+  /// @notice The supplied price vector does not match the pool tokens.
+  error InvalidPriceVector();
+
+  constructor(
+    address factory_
+  ) {
     factory = factory_;
     _APP_DATA = IBCoWFactory(factory_).APP_DATA();
   }
@@ -64,14 +83,59 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
       bytes memory sig
     )
   {
-    address[] memory tokenPair = tokens(pool);
-    Reserves memory reservesToken0 = _reserves(IBCoWPool(pool), IERC20(tokenPair[0]));
-    Reserves memory reservesToken1 = _reserves(IBCoWPool(pool), IERC20(tokenPair[1]));
+    address[] memory poolTokens = tokens(pool);
+    uint256 tokensLength = poolTokens.length;
+    if (prices.length != tokensLength) {
+      revert InvalidPriceVector();
+    }
 
-    (Reserves memory reservesIn, uint256 amountIn, Reserves memory reservesOut) =
-      _amountInFromPrices(reservesToken0, reservesToken1, prices);
+    IBCoWPool bCoWPool = IBCoWPool(pool);
+    Reserves[] memory reserves = new Reserves[](tokensLength);
+    uint256 priceScale;
+    for (uint256 i; i < tokensLength; i++) {
+      uint256 price = prices[i];
+      if (price == 0) {
+        revert InvalidPriceVector();
+      }
+      reserves[i] = _reserves(bCoWPool, IERC20(poolTokens[i]), price);
+      priceScale = price > priceScale ? price : priceScale;
+    }
 
-    return _orderFromBuyAmount(pool, reservesIn, amountIn, reservesOut);
+    OrderCandidate memory bestCandidate;
+    for (uint256 i; i < tokensLength - 1; i++) {
+      for (uint256 j = i + 1; j < tokensLength; j++) {
+        (Reserves memory reservesIn, uint256 amountIn, Reserves memory reservesOut) =
+          _amountInFromPrices(reserves[i], reserves[j]);
+
+        uint256 maxAmountIn = bmul(reservesIn.balance, MAX_IN_RATIO);
+        amountIn = amountIn > maxAmountIn ? maxAmountIn : amountIn;
+        if (amountIn == 0) continue;
+
+        uint256 amountOut = calcOutGivenIn({
+          tokenBalanceIn: reservesIn.balance,
+          tokenWeightIn: reservesIn.denormWeight,
+          tokenBalanceOut: reservesOut.balance,
+          tokenWeightOut: reservesOut.denormWeight,
+          tokenAmountIn: amountIn,
+          swapFee: 0
+        });
+        uint256 valueIn = Math.mulDiv(amountIn, reservesIn.price, priceScale);
+        uint256 valueOut = Math.mulDiv(amountOut, reservesOut.price, priceScale);
+        if (valueOut <= valueIn) continue;
+
+        uint256 surplus = valueOut - valueIn;
+        if (surplus > bestCandidate.surplus) {
+          bestCandidate =
+            OrderCandidate({reservesIn: reservesIn, reservesOut: reservesOut, amountIn: amountIn, surplus: surplus});
+        }
+      }
+    }
+
+    if (bestCandidate.amountIn == 0) {
+      revert NoOrder();
+    }
+
+    return _orderFromBuyAmount(pool, bestCandidate.reservesIn, bestCandidate.amountIn, bestCandidate.reservesOut);
   }
 
   /// @notice Method for returning the canonical order required to satisfy the
@@ -100,8 +164,8 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
   {
     address tokenIn = buyToken;
     address tokenOut = _otherTokenInPair(pool, tokenIn);
-    Reserves memory reservesIn = _reserves(IBCoWPool(pool), IERC20(tokenIn));
-    Reserves memory reservesOut = _reserves(IBCoWPool(pool), IERC20(tokenOut));
+    Reserves memory reservesIn = _reserves(IBCoWPool(pool), IERC20(tokenIn), 0);
+    Reserves memory reservesOut = _reserves(IBCoWPool(pool), IERC20(tokenOut), 0);
 
     return _orderFromBuyAmount(pool, reservesIn, buyAmount, reservesOut);
   }
@@ -135,8 +199,8 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
     address tokenOut = sellToken;
     address tokenIn = _otherTokenInPair(pool, tokenOut);
 
-    Reserves memory reservesIn = _reserves(IBCoWPool(pool), IERC20(tokenIn));
-    Reserves memory reservesOut = _reserves(IBCoWPool(pool), IERC20(tokenOut));
+    Reserves memory reservesIn = _reserves(IBCoWPool(pool), IERC20(tokenIn), 0);
+    Reserves memory reservesOut = _reserves(IBCoWPool(pool), IERC20(tokenOut), 0);
 
     uint256 amountIn = calcInGivenOut({
       tokenBalanceIn: reservesIn.balance,
@@ -150,7 +214,9 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
   }
 
   /// @inheritdoc ICOWAMMPoolHelper
-  function tokens(address pool) public view virtual returns (address[] memory tokens_) {
+  function tokens(
+    address pool
+  ) public view virtual returns (address[] memory tokens_) {
     // reverts in case pool is not deployed by the helper's factory
     if (!IBCoWFactory(factory).isBPool(pool)) {
       revert PoolDoesNotExist();
@@ -159,8 +225,8 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
     // call reverts with `BPool_PoolNotFinalized()` in case pool is not finalized
     tokens_ = IBCoWPool(pool).getFinalTokens();
 
-    // reverts in case pool is not supported (non-2-token pool)
-    if (tokens_.length != 2) {
+    // A registered pool can only contain between 2 and MAX_BOUND_TOKENS tokens.
+    if (tokens_.length < MIN_BOUND_TOKENS || tokens_.length > MAX_BOUND_TOKENS) {
       revert PoolDoesNotExist();
     }
   }
@@ -226,9 +292,7 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
 
     preInteractions = new GPv2Interaction.Data[](1);
     preInteractions[0] = GPv2Interaction.Data({
-      target: pool,
-      value: 0,
-      callData: abi.encodeWithSelector(IBCoWPool.commit.selector, orderCommitment)
+      target: pool, value: 0, callData: abi.encodeWithSelector(IBCoWPool.commit.selector, orderCommitment)
     });
 
     return (preInteractions, postInteractions, sig);
@@ -278,19 +342,33 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
     });
   }
 
+  /// @notice Returns information on pool reserves for a specific pool and token
+  /// @dev This is mostly used for the readability of grouping all parameters
+  /// relative to the same token are grouped together in the same variable
+  /// @param pool The pool with the funds
+  /// @param token The token on which to recover information
+  /// @param price Price of the token in the price vector
+  /// @return Parameters relative to the token reserves in the pool
+  function _reserves(
+    IBCoWPool pool,
+    IERC20 token,
+    uint256 price
+  ) internal view returns (Reserves memory) {
+    uint256 balance = token.balanceOf(address(pool));
+    uint256 denormalizedWeight = pool.getDenormalizedWeight(address(token));
+    return Reserves({token: token, balance: balance, denormWeight: denormalizedWeight, price: price});
+  }
+
   /// @notice Returns which trade is suggested to be executed on CoW Protocol
   /// for specific reserves of a pool given the current chain state and prices
   /// @param reservesToken0 Data related to the first token traded in the pool
   /// @param reservesToken1 Data related to the second token traded in the pool
-  /// @param prices supplied for determining the order; the format is specified
-  /// in the `order` function
   /// @return reservesIn Data related to the input token in the trade
   /// @return amountIn How much input token should be trated
   /// @return reservesOut Data related to the input token in the trade
   function _amountInFromPrices(
     Reserves memory reservesToken0,
-    Reserves memory reservesToken1,
-    uint256[] calldata prices
+    Reserves memory reservesToken1
   ) internal view returns (Reserves memory reservesIn, uint256 amountIn, Reserves memory reservesOut) {
     reservesOut = reservesToken0;
     reservesIn = reservesToken1;
@@ -303,17 +381,19 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
     // wO = reservesOut.denormWeight
     // p  = priceNumerator / priceDenominator
     //
-    // Note that in the code we use normalized weights instead of computing the
-    // full expression from raw weights. Since BCoW pools support only two
-    // tokens, this is equivalent to assuming that wI + wO = 1.
+    // Normalize weights relative to the selected pair. Other token balances
+    // remain unchanged during the swap and cancel out of the pool invariant.
+    uint256 pairWeight = badd(reservesToken0.denormWeight, reservesToken1.denormWeight);
+    uint256 normalizedWeight0 = bdiv(reservesToken0.denormWeight, pairWeight);
+    uint256 normalizedWeight1 = bdiv(reservesToken1.denormWeight, pairWeight);
 
     // The price of this function is expressed as amount of token1 per amount
     // of token0. The `prices` vector is expressed the other way around, as
     // confirmed by dimensional analysis of the expression above.
-    uint256 priceNumerator = prices[1]; // x token = sell token = out amount
-    uint256 priceDenominator = prices[0];
-    uint256 balanceOutTimesWeightIn = bmul(reservesOut.balance, reservesIn.normWeight);
-    uint256 balanceInTimesWeightOut = bmul(reservesIn.balance, reservesOut.normWeight);
+    uint256 priceNumerator = reservesToken1.price; // x token = sell token = out amount
+    uint256 priceDenominator = reservesToken0.price;
+    uint256 balanceOutTimesWeightIn = bmul(reservesOut.balance, normalizedWeight1);
+    uint256 balanceInTimesWeightOut = bmul(reservesIn.balance, normalizedWeight0);
 
     // This check compares the (weight-adjusted) pool spot price with the input
     // price. The formula for the pool's spot price can be found in the
@@ -328,13 +408,16 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
     // amount out is positive if and only if this inequality is false, meaning
     // that if the following condition matches then we want to invert the sell
     // and buy tokens.
-    if (bmul(balanceInTimesWeightOut, priceNumerator) > bmul(balanceOutTimesWeightIn, priceDenominator)) {
+    uint256 par = Math.mulDiv(balanceInTimesWeightOut, priceNumerator, priceDenominator);
+    if (par > balanceOutTimesWeightIn) {
       (reservesOut, reservesIn) = (reservesIn, reservesOut);
       (balanceOutTimesWeightIn, balanceInTimesWeightOut) = (balanceInTimesWeightOut, balanceOutTimesWeightIn);
       (priceNumerator, priceDenominator) = (priceDenominator, priceNumerator);
+      par = Math.mulDiv(balanceInTimesWeightOut, priceNumerator, priceDenominator);
     }
-    uint256 par = bdiv(bmul(balanceInTimesWeightOut, priceNumerator), priceDenominator);
     uint256 amountOut = balanceOutTimesWeightIn - par;
+    if (amountOut == 0) return (reservesIn, 0, reservesOut);
+
     amountIn = calcInGivenOut({
       tokenBalanceIn: reservesIn.balance,
       tokenWeightIn: reservesIn.denormWeight,
@@ -345,29 +428,21 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
     });
   }
 
-  /// @notice Returns information on pool reserves for a specific pool and token
-  /// @dev This is mostly used for the readability of grouping all parameters
-  /// relative to the same token are grouped together in the same variable
-  /// @param pool The pool with the funds
-  /// @param token The token on which to recover information
-  /// @return Parameters relative to the token reserves in the pool
-  function _reserves(IBCoWPool pool, IERC20 token) internal view returns (Reserves memory) {
-    uint256 balance = token.balanceOf(address(pool));
-    uint256 normalizedWeight = pool.getNormalizedWeight(address(token));
-    uint256 denormalizedWeight = pool.getDenormalizedWeight(address(token));
-    return Reserves({token: token, balance: balance, denormWeight: denormalizedWeight, normWeight: normalizedWeight});
-  }
-
   /// @notice For a two-token pool, this method takes one of the two traded
   /// tokens and returns the other.
   /// If the token is not traded in the pool, this function reverts.
   /// @param pool Two-token pool supporting the tokens
   /// @param token A token that is supported by the pool
   /// @return otherToken The other token supported by the two-token pool
-  function _otherTokenInPair(address pool, address token) internal view returns (address otherToken) {
+  function _otherTokenInPair(
+    address pool,
+    address token
+  ) internal view returns (address otherToken) {
     address[] memory tokenPair = tokens(pool);
 
-    if (tokenPair[0] == token) {
+    if (tokenPair.length != 2) {
+      revert InvalidToken();
+    } else if (tokenPair[0] == token) {
       otherToken = tokenPair[1];
     } else if (tokenPair[1] == token) {
       otherToken = tokenPair[0];

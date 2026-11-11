@@ -9,6 +9,8 @@ BCoWHelperTest::tokens
 ├── when pool has less than 2 tokens
 │   └── it should revert
 ├── when pool has more than 2 tokens
+│   └── it should return all pool tokens
+├── when pool has more than the maximum tokens
 │   └── it should revert
 ├── when pool with equal weights is supported
 │   └── it should return pool tokens
@@ -18,6 +20,15 @@ BCoWHelperTest::tokens
 BCoWHelperTest::order
 ├── when the pool is not supported
 │   └── it should revert
+├── when the price vector length does not match
+│   └── it should revert
+├── when a price is zero
+│   └── it should revert
+├── when all token pairs are at equilibrium
+│   └── it should revert
+├── when amount in exceeds the maximum ratio
+│   ├── it should cap the input amount
+│   └── it should return a valid pool order
 ├── when the pool is supported
 │   ├── it should call tokens
 │   ├── it should query the domain separator from the pool
@@ -25,6 +36,9 @@ BCoWHelperTest::order
 │   ├── it should return a commit pre-interaction
 │   ├── it should return an empty post-interaction
 │   └── it should return a valid signature
+├── when pool has more than 2 tokens
+│   ├── it should select the pair with the greatest surplus
+│   └── it should return a valid pool order
 ├── given a price skeweness to token1
 │   ├── it should buy token0
 │   └── it should return a valid pool order
