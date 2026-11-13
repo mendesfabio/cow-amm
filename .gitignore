@@ -1,6 +1,7 @@
 # General
 yarn-error.log
 node_modules
+.local/
 .DS_STORE
 .vscode
 
