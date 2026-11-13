@@ -416,6 +416,10 @@ contract BCoWHelper is ICOWAMMPoolHelper, BMath, BCoWConst {
       par = Math.mulDiv(balanceInTimesWeightOut, priceNumerator, priceDenominator);
     }
     uint256 amountOut = balanceOutTimesWeightIn - par;
+    // Apply Balancer's exact-output limit before the inverse quote. This
+    // keeps balanceOut / (balanceOut - amountOut) inside bpow's domain.
+    uint256 maxAmountOut = bmul(reservesOut.balance, MAX_OUT_RATIO);
+    amountOut = amountOut > maxAmountOut ? maxAmountOut : amountOut;
     if (amountOut == 0) return (reservesIn, 0, reservesOut);
 
     amountIn = calcInGivenOut({

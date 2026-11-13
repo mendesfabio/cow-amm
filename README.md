@@ -51,6 +51,7 @@ yarn test    # run the tests
 ## Features on BCoWHelper
 - Supports the full set of tokens bound to a finalized pool.
 - Returns the pairwise order with the greatest surplus at the supplied price vector.
+- Bounds candidate output by Balancer's `MAX_OUT_RATIO` before inverse quoting, then bounds input by `MAX_IN_RATIO`.
 - Keeps one pool order per settlement, using the existing transient commitment lock.
 
 ## Creating a Pool
